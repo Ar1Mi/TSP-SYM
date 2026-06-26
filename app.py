@@ -17,6 +17,10 @@ from tsp_solver import (
 )
 
 
+class SimulationCancelled(Exception):
+    pass
+
+
 class TSPSimulatorUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -80,6 +84,7 @@ class TSPSimulatorUI:
         self.history_avg: list[float] = []
         self._canvas_points: list[tuple[float, float]] = []
         self.custom_instances: dict[str, str] = {}
+        self.cancellation_requested = False
 
     def _build_layout(self) -> None:
         root_container = ttk.Frame(self.root, padding=10)
@@ -337,8 +342,15 @@ class TSPSimulatorUI:
         ttk.Button(frame, text="MULTIRUN", command=self._run_multi).grid(
             row=0, column=1, sticky="ew", padx=(4, 0)
         )
+        ttk.Button(frame, text="STOP", command=self._stop_simulation).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
 
         return frame
+
+    def _stop_simulation(self) -> None:
+        self.cancellation_requested = True
+        self.status_var.set("Stopping simulation...")
 
     def _build_debug_controls_frame(self, parent: ttk.Frame) -> ttk.LabelFrame:
         frame = ttk.LabelFrame(parent, text="Debug / Tests", padding=8)
@@ -630,6 +642,9 @@ class TSPSimulatorUI:
             return None
 
     def _on_generation_snapshot(self, snapshot: GenerationSnapshot) -> None:
+        if self.cancellation_requested:
+            raise SimulationCancelled("Simulation stopped by user")
+
         self.generation_label_var.set(str(snapshot.generation))
         self.best_tour_label_var.set(f"{snapshot.best_cost:.2f}")
         self.current_best_route = list(snapshot.best_route)
@@ -640,7 +655,7 @@ class TSPSimulatorUI:
         if snapshot.generation % 5 == 0 or snapshot.generation == 0:
             self._draw_instance_view()
             self._draw_convergence_chart()
-            self.root.update_idletasks()
+            self.root.update()
 
     def _draw_instance_view(self) -> None:
         canvas = self.instance_canvas
@@ -787,8 +802,9 @@ class TSPSimulatorUI:
             self.status_var.set(f"Invalid parameters: {exc}")
             return
 
+        self.cancellation_requested = False
         self.status_var.set("Running GA...")
-        self.root.update_idletasks()
+        self.root.update()
 
         self.history_best = []
         self.history_avg = []
@@ -800,6 +816,9 @@ class TSPSimulatorUI:
                 config=config,
                 progress_callback=self._on_generation_snapshot,
             )
+        except SimulationCancelled:
+            self.status_var.set("RUN stopped by user.")
+            return
         except Exception as exc:
             self.status_var.set(f"GA run failed: {exc}")
             return
@@ -837,11 +856,22 @@ class TSPSimulatorUI:
             self.status_var.set("Number of experiments must be >= 1.")
             return
 
+        self.cancellation_requested = False
         best_result: GARunResult | None = None
         best_overall = float("inf")
         avg_best_costs: list[float] = []
 
+        def _check_cancellation(snapshot: GenerationSnapshot) -> None:
+            if self.cancellation_requested:
+                raise SimulationCancelled("Simulation stopped by user")
+            # Limit GUI updates to save CPU, but process events
+            if snapshot.generation % 10 == 0:
+                self.root.update()
+
         for run_idx in range(experiments):
+            if self.cancellation_requested:
+                break
+
             run_seed = base_config.seed + run_idx if base_config.seed is not None else None
             config = GAConfig(
                 population_size=base_config.population_size,
@@ -860,14 +890,31 @@ class TSPSimulatorUI:
             )
 
             self.status_var.set(f"MULTIRUN progress: {run_idx + 1}/{experiments}")
-            self.root.update_idletasks()
-            result = run_ga(instance=self.current_instance, config=config, progress_callback=None)
+            self.root.update()
+            
+            try:
+                result = run_ga(
+                    instance=self.current_instance,
+                    config=config,
+                    progress_callback=_check_cancellation,
+                )
+            except SimulationCancelled:
+                break
+            except Exception as exc:
+                self.status_var.set(f"GA run failed at run {run_idx + 1}: {exc}")
+                return
+                
             avg_best_costs.append(result.best_cost)
             if result.best_cost < best_overall:
                 best_overall = result.best_cost
                 best_result = result
 
-        if best_result is None:
+        if self.cancellation_requested:
+            if best_result is None:
+                self.status_var.set("MULTIRUN stopped. No runs completed.")
+                return
+            self.status_var.set(f"MULTIRUN stopped. Completed {len(avg_best_costs)} runs.")
+        elif best_result is None:
             self.status_var.set("MULTIRUN failed to produce a result.")
             return
 
@@ -881,15 +928,17 @@ class TSPSimulatorUI:
         self.optimal_tour_label_var.set(f"{optimal_cost:.2f}" if optimal_cost is not None else "--")
         self._draw_instance_view()
         self._draw_convergence_chart()
+        
+        runs_completed = len(avg_best_costs)
         if optimal_cost is not None and optimal_cost > 0:
             gap = ((best_result.best_cost - optimal_cost) / optimal_cost) * 100.0
             self.status_var.set(
-                f"MULTIRUN ({experiments}) done. Best={best_result.best_cost:.2f}, "
+                f"MULTIRUN ({runs_completed}) done. Best={best_result.best_cost:.2f}, "
                 f"mean best={mean(avg_best_costs):.2f}, gap={gap:+.2f}%."
             )
         else:
             self.status_var.set(
-                f"MULTIRUN finished ({experiments} runs). Best={best_result.best_cost:.2f}, "
+                f"MULTIRUN finished ({runs_completed} runs). Best={best_result.best_cost:.2f}, "
                 f"mean best={mean(avg_best_costs):.2f}."
             )
 

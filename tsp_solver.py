@@ -93,6 +93,14 @@ def load_instance_by_name(name: str, project_root: Path | None = None) -> TSPIns
     if direct_path.exists():
         return load_tsplib_instance(direct_path)
 
+    local_candidate = Path("instances") / name
+    if local_candidate.exists():
+        return load_tsplib_instance(local_candidate)
+
+    script_candidate = Path(__file__).parent / "instances" / name
+    if script_candidate.exists():
+        return load_tsplib_instance(script_candidate)
+
     if project_root is not None:
         candidate = project_root / "instances" / name
         if candidate.exists():
@@ -173,7 +181,14 @@ def load_tsplib_instance(path: str | Path) -> TSPInstance:
         raise ValueError("TSPLIB instance must contain at least 2 cities")
 
     optimal = _BUNDLED_SPECS.get(file_path.name, (0, 0, None))[2]
-    reference_route = _build_reference_route(coords)
+    
+    # Look for a companion .opt.tour file
+    tour_name = file_path.stem + ".opt.tour"
+    tour_path = file_path.parent / tour_name
+    reference_route = _load_optimal_tour(tour_path)
+    if reference_route is None:
+        reference_route = _build_reference_route(coords)
+
     return TSPInstance(
         name=name,
         cities=tuple(coords),
@@ -181,6 +196,37 @@ def load_tsplib_instance(path: str | Path) -> TSPInstance:
         reference_route=tuple(reference_route),
         source=str(file_path),
     )
+
+
+def _load_optimal_tour(tour_path: Path) -> list[int] | None:
+    if not tour_path.exists():
+        return None
+    try:
+        route: list[int] = []
+        in_tour_section = False
+        with tour_path.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                upper = line.upper()
+                if upper.startswith("EOF"):
+                    break
+                if upper.startswith("TOUR_SECTION"):
+                    in_tour_section = True
+                    continue
+                if not in_tour_section:
+                    continue
+                try:
+                    val = int(line)
+                    if val == -1:
+                        break
+                    route.append(val - 1)  # Convert 1-based TSPLIB index to 0-based
+                except ValueError:
+                    continue
+        return route
+    except Exception:
+        return None
 
 
 def _synthetic_cities(dimension: int, seed: int) -> list[City]:
